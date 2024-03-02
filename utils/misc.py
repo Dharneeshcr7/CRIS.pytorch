@@ -56,6 +56,22 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
+def concat_all_gather2(tensor):
+    """
+    Performs all_gather operation on the provided tensors.
+    *** Warning ***: torch.distributed.all_gather has no gradient.
+    """
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        tensors_gather = [
+            torch.ones_like(tensor)
+            for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(tensors_gather, tensor, async_op=False)
+
+        output = torch.cat(tensors_gather, dim=0)
+        return output
+    else:
+        return tensor
 
 
 def worker_init_fn(worker_id, num_workers, rank, seed):

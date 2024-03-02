@@ -10,8 +10,36 @@ import torch.nn.functional as F
 import wandb
 from loguru import logger
 from utils.dataset import tokenize
-from utils.misc import (AverageMeter, ProgressMeter, concat_all_gather,
+from utils.misc import (AverageMeter, ProgressMeter, concat_all_gather,concat_all_gather2,
                         trainMetricGPU)
+
+
+def pad_to_same_shape(pred, mask):
+
+    # Determine which array is larger
+    larger_rows = max(pred.shape[0], mask.shape[0])
+    larger_cols = max(pred.shape[1], mask.shape[1])
+
+    # Calculate the padding for each side for pred
+    pad_top_pred = max(0, (larger_rows - pred.shape[0]) // 2)
+    pad_bottom_pred = max(0, larger_rows - pred.shape[0] - pad_top_pred)
+    pad_left_pred = max(0, (larger_cols - pred.shape[1]) // 2)
+    pad_right_pred = max(0, larger_cols - pred.shape[1] - pad_left_pred)
+
+    # Pad pred to the determined shape
+    pred_padded = np.pad(pred, ((pad_top_pred, pad_bottom_pred), (pad_left_pred, pad_right_pred)), 'constant', constant_values=0)
+
+    # Calculate the padding for each side for mask
+    pad_top_mask = max(0, (larger_rows - mask.shape[0]) // 2)
+    pad_bottom_mask = max(0, larger_rows - mask.shape[0] - pad_top_mask)
+    pad_left_mask = max(0, (larger_cols - mask.shape[1]) // 2)
+    pad_right_mask = max(0, larger_cols - mask.shape[1] - pad_left_mask)
+
+    # Pad mask to the determined shape
+    mask_padded = np.pad(mask, ((pad_top_mask, pad_bottom_mask), (pad_left_mask, pad_right_mask)), 'constant', constant_values=0)
+
+    return pred_padded, mask_padded
+
 
 
 def train(train_loader, model, optimizer, scheduler, scaler, epoch, args):
@@ -37,9 +65,13 @@ def train(train_loader, model, optimizer, scheduler, scaler, epoch, args):
     for i, (image, text, target) in enumerate(train_loader):
         data_time.update(time.time() - end)
         # data
-        image = image.cuda(non_blocking=True)
-        text = text.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True).unsqueeze(1)
+        # image = image.cuda(non_blocking=True)
+        # text = text.cuda(non_blocking=True)
+        # target = target.cuda(non_blocking=True).unsqueeze(1)
+
+        image = image.cuda(non_blocking=True) if torch.cuda.is_available() else image.cpu()
+        text = text.cuda(non_blocking=True) if torch.cuda.is_available() else text.cpu()
+        target = target.cuda(non_blocking=True).unsqueeze(1) if torch.cuda.is_available() else target.cpu().unsqueeze(1)
 
         # # multi-scale training
         # image = F.interpolate(image, size=(new_size, new_size), mode='bilinear')
@@ -58,12 +90,12 @@ def train(train_loader, model, optimizer, scheduler, scaler, epoch, args):
 
         # metric
         iou, pr5 = trainMetricGPU(pred, target, 0.35, 0.5)
-        dist.all_reduce(loss.detach())
-        dist.all_reduce(iou)
-        dist.all_reduce(pr5)
-        loss = loss / dist.get_world_size()
-        iou = iou / dist.get_world_size()
-        pr5 = pr5 / dist.get_world_size()
+        # dist.all_reduce(loss.detach())
+        # dist.all_reduce(iou)
+        # dist.all_reduce(pr5)
+        # loss = loss / dist.get_world_size()
+        # iou = iou / dist.get_world_size()
+        # pr5 = pr5 / dist.get_world_size()
 
         loss_meter.update(loss.item(), image.size(0))
         iou_meter.update(iou.item(), image.size(0))
@@ -94,8 +126,8 @@ def validate(val_loader, model, epoch, args):
     time.sleep(2)
     for imgs, texts, param in val_loader:
         # data
-        imgs = imgs.cuda(non_blocking=True)
-        texts = texts.cuda(non_blocking=True)
+        # imgs = imgs.cuda(non_blocking=True)
+        # texts = texts.cuda(non_blocking=True)
         # inference
         preds = model(imgs, texts)
         preds = torch.sigmoid(preds)
@@ -116,15 +148,19 @@ def validate(val_loader, model, epoch, args):
                                   borderValue=0.)
             pred = np.array(pred > 0.35)
             mask = cv2.imread(mask_dir, flags=cv2.IMREAD_GRAYSCALE)
+            
             mask = mask / 255.
             # iou
+            #print(pred.shape,mask.shape)
+            pred,mask=pad_to_same_shape(pred,mask)
+            #print(pred.shape,mask.shape)
             inter = np.logical_and(pred, mask)
             union = np.logical_or(pred, mask)
             iou = np.sum(inter) / (np.sum(union) + 1e-6)
             iou_list.append(iou)
     iou_list = np.stack(iou_list)
     iou_list = torch.from_numpy(iou_list).to(imgs.device)
-    iou_list = concat_all_gather(iou_list)
+    iou_list = concat_all_gather2(iou_list)
     prec_list = []
     for thres in torch.arange(0.5, 1.0, 0.1):
         tmp = (iou_list > thres).float().mean()
@@ -149,15 +185,23 @@ def inference(test_loader, model, args):
     tbar = tqdm(test_loader, desc='Inference:', ncols=100)
     model.eval()
     time.sleep(2)
+    i=0
     for img, param in tbar:
+        i+=1
         # data
-        img = img.cuda(non_blocking=True)
+        #img = img.cuda(non_blocking=True)
+
+        img = img.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"), non_blocking=True)
+
         mask = cv2.imread(param['mask_dir'][0], flags=cv2.IMREAD_GRAYSCALE)
         # dump image & mask
         if args.visualize:
-            seg_id = param['seg_id'][0].cpu().numpy()
-            img_name = '{}-img.jpg'.format(seg_id)
-            mask_name = '{}-mask.png'.format(seg_id)
+            # seg_id = param['seg_id'][0].cpu().numpy()
+            # img_name = '{}-img.jpg'.format(seg_id)
+            # mask_name = '{}-mask.png'.format(seg_id)
+
+            img_name = f"{i}-img.jpg"
+            mask_name = f'{i}-mask.png'
             cv2.imwrite(filename=os.path.join(args.vis_dir, img_name),
                         img=param['ori_img'][0].cpu().numpy())
             cv2.imwrite(filename=os.path.join(args.vis_dir, mask_name),
@@ -166,7 +210,10 @@ def inference(test_loader, model, args):
         for sent in param['sents']:
             mask = mask / 255.
             text = tokenize(sent, args.word_len, True)
-            text = text.cuda(non_blocking=True)
+            #text = text.cuda(non_blocking=True)
+
+            text = text.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"), non_blocking=True)
+
             # inference
             pred = model(img, text)
             pred = torch.sigmoid(pred)
@@ -184,6 +231,7 @@ def inference(test_loader, model, args):
                                   borderValue=0.)
             pred = np.array(pred > 0.35)
             # iou
+            pred,mask=pad_to_same_shape(pred,mask)
             inter = np.logical_and(pred, mask)
             union = np.logical_or(pred, mask)
             iou = np.sum(inter) / (np.sum(union) + 1e-6)
@@ -192,7 +240,7 @@ def inference(test_loader, model, args):
             if args.visualize:
                 pred = np.array(pred*255, dtype=np.uint8)
                 sent = "_".join(sent[0].split(" "))
-                pred_name = '{}-iou={:.2f}-{}.png'.format(seg_id, iou*100, sent)
+                pred_name = f'{i}.png'
                 cv2.imwrite(filename=os.path.join(args.vis_dir, pred_name),
                             img=pred)
     logger.info('=> Metric Calculation <=')
